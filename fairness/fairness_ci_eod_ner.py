@@ -1,23 +1,10 @@
 """
-Fairness evaluation with bootstrap CIs + Equalized Odds, MULTI-SEED version.
-Yasmina El Kacemi - University of Amsterdam
+Fairness evaluation with bootstrap CIs and Equalized Odds.
 
-Parametrised copy of fairness_ci_eod.py. All metric / bootstrap / threshold
-logic is unchanged. Only the I/O is parametrised so it can run per seed:
+This script loads the baseline and SCM models for one seed, computes fairness
+metrics, and saves the results in the seed output folder.
 
-  python fairness_ci_eod_multiseed.py --pairs scm --seed 42
-
-  - OUTPUT_DIR  = {root}/legal-bert_{pairs}_seed{seed}
-  - BEST_LAM    is read per-seed from that dir's contrastive_faithfulness.json
-                (same operating point as DPD/DI and faithfulness)
-  - models      loaded from that seed dir
-  - output      written into that seed dir as fairness_ci_eod.json
-    (so a seed array never overwrites another seed)
-
-Group membership uses the SAME whole-word regex matcher and the SAME
-'targeted' keyword sets as run_contrastive_v2.py (gender = 40 terms incl.
-pronouns, ethnicity = 23 curated minority terms), so EOD is computed on the
-same protected groups as the DPD/DI in contrastive_fairness.json.
+The ethnicity group can be based on either keywords or a saved NER mask.
 """
 
 import os, re, json, argparse, warnings
@@ -58,7 +45,7 @@ OUTPUT_DIR = os.path.join(args.root, RUN_TAG)
 assert os.path.isdir(OUTPUT_DIR), f'missing dir {OUTPUT_DIR}'
 print(f'Seed: {SEED}  Dir: {OUTPUT_DIR}')
 
-# per-seed best lambda, read from the same JSON the faithfulness run used
+# Read the best lambda for this seed
 BEST_LAM = json.load(
     open(os.path.join(OUTPUT_DIR, 'contrastive_faithfulness.json'))
 )['lambda']
@@ -75,8 +62,7 @@ ARTICLE_NAMES = ['Art.2', 'Art.3', 'Art.5', 'Art.6', 'Art.8', 'Art.9',
                  'Art.10', 'Art.11', 'Art.14', 'P1-1']
 RELIABLE      = {'Art.2', 'Art.3', 'Art.5', 'Art.6', 'Art.8', 'Art.10', 'P1-1'}
 
-# EXACT copy of run_contrastive_v2.py 'targeted' active sets.
-# Gender targeted = extended (40 terms, female + male referential), pronouns kept.
+# Gender keywords
 GENDER_KEYWORDS = [
     # female-referential
     'woman', 'women', 'female', 'girl', 'mother', 'wife', 'daughter',
@@ -87,7 +73,8 @@ GENDER_KEYWORDS = [
     'he', 'him', 'his', 'gentleman', 'groom', 'boyfriend', 'stepfather',
     'grandfather', 'schoolboy', 'daddy', 'uncle', 'nephew',
 ]
-# Ethnicity targeted = 23 curated minority terms (no nationality adjectives).
+
+# Ethnicity keywords
 ETHNICITY_KEYWORDS = [
     'roma', 'romani', 'gypsy', 'kurdish', 'kurd', 'chechen',
     'jewish', 'muslim', 'christian', 'orthodox',
@@ -177,7 +164,7 @@ def predict_probs(model, ids, mask, batch=16):
         probs.append(p)
     return np.vstack(probs)
 
-# -- Per-article threshold tuning on validation (maximise F1) ------------------
+# -- Per-article threshold tuning on validation --------------------------------
 def tune_thresholds(val_probs, val_labels):
     thr = np.full(N_LABELS, 0.5)
     for a in range(N_LABELS):
@@ -208,7 +195,7 @@ def macro_f1_reliable(pred, y):
         f1s.append(2 * prec * rec / (prec + rec) if prec + rec else 0.0)
     return float(np.mean(f1s))
 
-# -- Group membership: EXACT whole-word regex matcher from run_contrastive_v2.py
+# -- Group membership ----------------------------------------------------------
 def build_keyword_pattern(keywords):
     escaped = [re.escape(kw) for kw in keywords]
     return re.compile(r'\b(?:' + '|'.join(escaped) + r')\b', flags=re.IGNORECASE)
@@ -273,12 +260,6 @@ print(f'\nSanity: macro F1  baseline={f1_base:.4f}  SCM={f1_scm:.4f}')
 AXES = {'gender': GENDER_KEYWORDS, 'ethnicity': ETHNICITY_KEYWORDS}
 
 # -- Optional NER ethnicity mask -----------------------------------------------
-# When --ethnicity_source ner, the ethnicity protected group is taken from the
-# precomputed NER NORP-minority mask in ner_groups.json instead of the keyword
-# matcher. The NER mask was built in load_dataset order; we verify alignment by
-# recomputing the keyword ethnicity mask here and checking it matches the
-# keyword mask stored in the JSON. If they differ, the document order is out of
-# sync and we abort rather than silently mislabel groups.
 NER_ETH_MASK = None
 if args.ethnicity_source == 'ner':
     ner_path = os.path.join(args.root, 'ner_groups.json')
