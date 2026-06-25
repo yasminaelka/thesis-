@@ -1,4 +1,3 @@
-```python
 """
 check_group_sizes_v2.py
 -----------------------
