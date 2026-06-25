@@ -1,4 +1,3 @@
-```python
 """
 Fairness evaluation with bootstrap CIs + Equalized Odds, MULTI-SEED version.
 Yasmina El Kacemi - University of Amsterdam
