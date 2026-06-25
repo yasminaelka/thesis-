@@ -1,31 +1,10 @@
 """
-NER-based protected-group precompute for the ethnicity axis.
-Yasmina El Kacemi - University of Amsterdam
+Precompute NER-based ethnicity groups.
 
-Independent second operationalisation of the ETHNICITY protected group,
-as a robustness check on the keyword-based grouping used in
-fairness_ci_eod_multiseed.py.
+This script builds an ethnicity protected-group mask from spaCy NER and saves it
+so the fairness scripts can reuse it later.
 
-Method: a document is ETHNICITY-protected if spaCy NER (en_core_web_sm)
-tags at least one NORP entity in its text. NORP = "nationalities,
-religious or political groups", which maps directly onto the ethnicity
-axis and is methodologically independent of keyword matching.
-
-This grouping depends only on the document text, NOT on the model or the
-seed, so it is computed ONCE over the test set and saved to JSON. The
-per-seed fairness runs then load this mask instead of recomputing NER.
-
-Run on a login node (CPU is fine):
-  python ner_groups.py
-Optional:
-  python ner_groups.py --include_gpe   # also count GPE (countries/cities)
-
-Output: ner_groups.json in --root, containing for the test split:
-  - ethnicity_norp        : bool mask (NORP only)         [primary]
-  - ethnicity_norp_gpe    : bool mask (NORP or GPE)       [secondary]
-  - the matched entity strings per doc (for manual inspection)
-The keyword ethnicity mask is also recomputed here so the two
-distributions can be printed side by side.
+It also saves the keyword-based mask for comparison.
 """
 
 import os, re, json, argparse, warnings
@@ -36,6 +15,7 @@ import spacy
 from datasets import load_dataset
 
 # -- CLI -----------------------------------------------------------------------
+
 ap = argparse.ArgumentParser()
 ap.add_argument('--root', default='/gpfs/home6/yelkacemi/output')
 ap.add_argument('--spacy_model', default='en_core_web_sm')
@@ -46,7 +26,8 @@ args = ap.parse_args()
 
 OUT_PATH = os.path.join(args.root, 'ner_groups.json')
 
-# -- Keyword ethnicity set: EXACT copy from fairness_ci_eod_multiseed.py -------
+# -- Keyword ethnicity set -----------------------------------------------------
+
 ETHNICITY_KEYWORDS = [
     'roma', 'romani', 'gypsy', 'kurdish', 'kurd', 'chechen',
     'jewish', 'muslim', 'christian', 'orthodox',
@@ -56,17 +37,18 @@ ETHNICITY_KEYWORDS = [
 ]
 
 def build_keyword_pattern(keywords):
+    # Build one whole-word regex
     escaped = [re.escape(kw) for kw in keywords]
     return re.compile(r'\b(?:' + '|'.join(escaped) + r')\b', flags=re.IGNORECASE)
 
 def keyword_mask(texts, keywords):
+    # Mark documents that match at least one keyword
     pat = build_keyword_pattern(keywords)
     return np.array([bool(pat.search(t)) for t in texts], dtype=bool)
 
-# -- Load test split EXACTLY as the fairness script does -----------------------
-# fairness_ci_eod_multiseed.py lowercases the joined text; we keep the original
-# case for NER (NER needs case) but build texts in the SAME ORDER, and lowercase
-# only for the keyword comparison.
+# -- Load test split -----------------------------------------------------------
+
+# Keep cased text for NER and lowercase text for keyword matching
 print('Loading dataset ...')
 raw = load_dataset('coastalcph/lex_glue', 'ecthr_a', trust_remote_code=True)
 
@@ -79,18 +61,22 @@ test_texts_lower = [t.lower() for t in test_texts_cased]      # for keyword matc
 N = len(test_texts_cased)
 print(f'Test documents: {N}')
 
-# -- Keyword distribution (for side-by-side comparison) ------------------------
+# -- Keyword distribution ------------------------------------------------------
+
+# Compute keyword-based ethnicity group for comparison
 kw_mask = keyword_mask(test_texts_lower, ETHNICITY_KEYWORDS)
 print(f'\n[keyword]  ethnicity protected = {int(kw_mask.sum())}  '
       f'unprotected = {int((~kw_mask).sum())}')
 
 # -- NER -----------------------------------------------------------------------
+
 print(f'\nLoading spaCy model: {args.spacy_model} ...')
-# We only need the NER component; disabling others speeds it up a lot.
+
+# Only NER is needed here
 nlp = spacy.load(args.spacy_model, disable=['lemmatizer', 'tagger', 'parser',
                                             'attribute_ruler'])
-# spaCy default max_length is 1_000_000 chars; ECtHR docs can be long but the
-# join is well under that. Bump anyway to be safe.
+
+# Increase max length for longer documents
 nlp.max_length = 5_000_000
 
 norp_mask = np.zeros(N, dtype=bool)
@@ -112,6 +98,8 @@ for i, doc in enumerate(nlp.pipe(test_texts_cased, batch_size=args.batch_size)):
 norp_gpe_mask = norp_mask | gpe_mask
 
 # -- Distributions -------------------------------------------------------------
+
+# Print group sizes for each method
 print('\n=== ethnicity protected-group distribution (test set) ===')
 print(f'{"method":22s} {"protected":>10s} {"unprotected":>12s}')
 print('-' * 46)
@@ -119,7 +107,7 @@ print(f'{"keyword (current)":22s} {int(kw_mask.sum()):>10d} {int((~kw_mask).sum(
 print(f'{"NER NORP":22s} {int(norp_mask.sum()):>10d} {int((~norp_mask).sum()):>12d}')
 print(f'{"NER NORP or GPE":22s} {int(norp_gpe_mask.sum()):>10d} {int((~norp_gpe_mask).sum()):>12d}')
 
-# overlap between keyword and NORP, to show they are genuinely different proxies
+# Compare keyword and NER masks
 agree = int((kw_mask == norp_mask).sum())
 both  = int((kw_mask & norp_mask).sum())
 print(f'\nkeyword vs NORP: agree on {agree}/{N} docs; '
@@ -128,6 +116,8 @@ print(f'\nkeyword vs NORP: agree on {agree}/{N} docs; '
       f'NORP-only={int((~kw_mask & norp_mask).sum())}')
 
 # -- Save ----------------------------------------------------------------------
+
+# Save masks and matched entities
 out = {
     'meta': {
         'split': 'test',
@@ -146,6 +136,8 @@ out = {
 with open(OUT_PATH, 'w') as f:
     json.dump(out, f, indent=2)
 print(f'\nSaved: {OUT_PATH}')
+
+# Print a few examples for checking
 print('\nInspect a few NORP hits:')
 shown = 0
 for i in range(N):
