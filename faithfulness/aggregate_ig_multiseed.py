@@ -1,6 +1,5 @@
 """
-Aggregate the five-seed IG faithfulness runs into a mean +/- std table that
-replaces the single-seed Table 6.
+Aggregate the five-seed IG faithfulness runs into a mean +/- std table.
 
 Reads, per seed dir:  contrastive_ig_multiseed.json
 Writes:               ~/output/aggregate_ig_multiseed.json
