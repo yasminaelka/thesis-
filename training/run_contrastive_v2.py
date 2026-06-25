@@ -49,13 +49,13 @@ parser.add_argument('--seed', type=int, default=42,
                     help='Random seed for all RNGs (default: 42)')
 parser.add_argument('--skip_shap', action='store_true',
                     help='Skip Phase 5 SHAP faithfulness (for cheap multi-seed runs)')
-# --- New: broader baselines (committee point 4) ---
+# broader baselines --
 # Encoder lets the same pipeline run LegalBERT, vanilla BERT, or RoBERTa, so
 # the "is the effect specific to LegalBERT?" question can be answered.
 parser.add_argument('--encoder', type=str, default='legal-bert',
                     choices=['legal-bert', 'bert', 'roberta'],
                     help='Backbone encoder (default: legal-bert)')
-# --- New: SCM-specificity control (committee point 3) ---
+# SCM-specificity control --
 # The regularised arm can use the real SCM antonym pairs, the same words with
 # the pairings SHUFFLED (vocabulary held constant, antonym structure broken),
 # or RANDOM vocabulary pairs. If 'shuffled'/'random' reproduces the same
@@ -63,11 +63,11 @@ parser.add_argument('--encoder', type=str, default='legal-bert',
 parser.add_argument('--pairs', type=str, default='scm',
                     choices=['scm', 'shuffled', 'random'],
                     help='Pair set for the regularised arm (default: scm)')
-# --- New: keyword set selection (Sahand / fairness proxy point) ---
+# keyword set selection (fairness proxy point) ---
 parser.add_argument('--keyword_set', type=str, default='targeted',
                     choices=['original', 'extended', 'targeted'],
                     help='Active demographic keyword set for fairness (default: targeted)')
-# --- New: fast end-to-end validation before launching on SLURM ---
+# fast end-to-end validation before launching on SLURM ---
 parser.add_argument('--smoke_test', action='store_true',
                     help='Tiny subset, 1 epoch, single lambda, 4 SHAP docs. '
                          'Use to verify the script runs end-to-end in minutes.')
@@ -90,7 +90,7 @@ if DEVICE == 'cuda':
     print(f'GPU   : {torch.cuda.get_device_name(0)}')
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-# Encoder choice (committee point 4). Output is keyed by encoder + pair set +
+# Encoder choice. Output is keyed by encoder + pair set +
 # seed so no two runs in the campaign ever overwrite each other.
 
 # These model names are used depending on the chosen encoder argument
@@ -122,7 +122,7 @@ ARTICLE_NAMES = ['Art.2','Art.3','Art.5','Art.6','Art.8','Art.9',
 
 # Reliability is now DERIVED from an explicit rule, not hardcoded.
 # RELIABILITY_BASIS documents exactly what the threshold counts, which is the
-# clarification the committee asked for. 'test_pos' = ground-truth positive
+# test_pos' = ground-truth positive
 # labels in the test set (the Table 1 numbers).
 RELIABILITY_BASIS = 'test_pos'     # 'test_pos' | 'pred_pos' | 'protected_pos'
 MIN_RELIABLE      = 30             # articles with >= this many are 'reliable'
@@ -259,7 +259,7 @@ ETHNICITY_KEYWORDS_EXTENDED = [
     'lebanese',
 ]
 
-# --- Targeted ethnicity list (Sahand / construct-validity fix) -------------------
+# --- Targeted ethnicity list (construct-validity fix) -------------------
 # The 'extended' list above mixes ethnicity/minority terms with nationality
 # adjectives (european, american, british, french, ...). Respondent states are
 # named in almost every ECtHR judgment, so those adjectives match ~50% of docs
@@ -277,7 +277,7 @@ ETHNICITY_KEYWORDS_TARGETED = [
     'indigenous', 'aboriginal', 'caste',
 ]
 
-# Gender keeps pronouns (Sahand's decision): pronouns carry genuine gender
+# Gender keeps pronouns: pronouns carry genuine gender
 # information in legal text, and we prioritise construct validity over a
 # favourable group balance even though this leaves the split near-even.
 GENDER_KEYWORDS_TARGETED = GENDER_KEYWORDS_EXTENDED
@@ -327,7 +327,7 @@ print(f'Keyword set: {KEYWORD_SET} '
 print('Loading tokenizer ...')
 TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-# ── Active pair set + control conditions (committee point 3) ───────────────────
+# ── Active pair set + control conditions ───────────────────
 # 'scm'      : real warmth/competence antonym pairs (the treatment).
 # 'shuffled' : same words, pairings permuted -> antonym structure destroyed,
 #              vocabulary identical. Best control for "is it the SCM construct?".
@@ -678,12 +678,7 @@ def apply_thresholds(probs, thresholds):
 test_preds_b = apply_thresholds(test_probs_b, thresh_b)
 test_preds_s = apply_thresholds(test_probs_s, thresh_s)
 
-# ── Reliability, derived from an explicit rule (committee point: 30 vs 37) ──────
-# The old code hardcoded which articles were "reliable", so the stated rule
-# (<30) did not match the set actually used (Art.11 has 37 test positives yet
-# was excluded). Here reliability is COMPUTED from one documented basis and all
-# three candidate bases are reported, so the thesis can state precisely what the
-# threshold counts.
+# ── Reliability, derived from an explicit rule ──────
 
 # Build protected/unprotected groups for all keyword sets
 GROUP_INDICES = {
@@ -720,7 +715,6 @@ if RELIABLE != _legacy_reliable:
     print(f'NOTE: derived reliable set differs from the legacy hardcoded set.')
     print(f'  derived: {sorted(RELIABLE)}')
     print(f'  legacy : {sorted(_legacy_reliable)}')
-    print('  Update the thesis text to match the derived set and the stated basis.')
 
 # Save the reliability information for later reporting
 with open(os.path.join(OUTPUT_DIR, 'reliability_report.json'), 'w') as f:
