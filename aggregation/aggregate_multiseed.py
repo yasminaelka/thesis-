@@ -1,4 +1,3 @@
-```python
 """
 Aggregate fairness + faithfulness across 5 seeds.
 Yasmina El Kacemi - University of Amsterdam
