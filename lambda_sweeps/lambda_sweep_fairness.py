@@ -1,28 +1,16 @@
+```
 """
-Fairness evaluation with bootstrap CIs + Equalized Odds, MULTI-SEED version.
-Yasmina El Kacemi - University of Amsterdam
+Multi-seed fairness evaluation.
 
-Parametrised copy of fairness_ci_eod.py. All metric / bootstrap / threshold
-logic is unchanged. Only the I/O is parametrised so it can run per seed:
+This script loads the baseline and SCM models for one seed, then computes
+fairness metrics with bootstrap confidence intervals.
 
-  python fairness_ci_eod_multiseed.py --pairs scm --seed 42
-
-  - OUTPUT_DIR  = {root}/legal-bert_{pairs}_seed{seed}
-  - BEST_LAM    is read per-seed from that dir's contrastive_faithfulness.json
-                (same operating point as DPD/DI and faithfulness)
-  - models      loaded from that seed dir
-  - output      written into that seed dir as fairness_ci_eod.json
-    (so a seed array never overwrites another seed)
-
-Group membership uses the SAME whole-word regex matcher and the SAME
-'targeted' keyword sets as run_contrastive_v2.py (gender = 40 terms incl.
-pronouns, ethnicity = 23 curated minority terms), so EOD is computed on the
-same protected groups as the DPD/DI in contrastive_fairness.json.
+Results are saved in the same seed output folder.
 """
 
 import os, re, json, argparse, warnings
 
-# Hide warnings so the output is easier to read
+# Keep output cleaner
 warnings.filterwarnings('ignore')
 
 import numpy as np
@@ -33,7 +21,7 @@ from datasets import load_dataset
 
 # -- CLI -----------------------------------------------------------------------
 
-# Read command line arguments for the run
+# Read run settings from the command line
 ap = argparse.ArgumentParser()
 ap.add_argument('--encoder', default='legal-bert')
 ap.add_argument('--pairs',   default='scm')
@@ -41,13 +29,13 @@ ap.add_argument('--seed',    type=int, default=42)
 ap.add_argument('--root',    default='/gpfs/home6/yelkacemi/output')
 args = ap.parse_args()
 
-# Use the selected seed and make the run reproducible
+# Set the seed
 SEED = args.seed
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
-# Use GPU if available, otherwise use CPU
+# Use GPU if available
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f'Device: {DEVICE}')
 if DEVICE == 'cuda':
@@ -55,21 +43,21 @@ if DEVICE == 'cuda':
 
 # -- Per-seed paths ------------------------------------------------------------
 
-# Build the output folder path for this seed
+# Folder for this seed
 RUN_TAG    = f'{args.encoder}_{args.pairs}_seed{SEED}'
 OUTPUT_DIR = os.path.join(args.root, RUN_TAG)
 
-# Stop if the expected seed folder does not exist
+# Check that the folder exists
 assert os.path.isdir(OUTPUT_DIR), f'missing dir {OUTPUT_DIR}'
 print(f'Seed: {SEED}  Dir: {OUTPUT_DIR}')
 
-# per-seed best lambda, read from the same JSON the faithfulness run used
+# Read the best lambda for this seed
 BEST_LAM = json.load(
     open(os.path.join(OUTPUT_DIR, 'contrastive_faithfulness.json'))
 )['lambda']
 print(f'BEST_LAM (per-seed, from contrastive_faithfulness.json) = {BEST_LAM}')
 
-# Main model and evaluation settings
+# Main settings
 MODEL_NAME    = 'nlpaueb/legal-bert-base-uncased'
 N_LABELS      = 10
 MAX_LEN       = 512
@@ -77,15 +65,14 @@ HEAD, TAIL    = 256, 256
 N_BOOT        = 10000
 TAU_GRID      = np.round(np.arange(0.05, 0.96, 0.05), 2)
 
-# Article names in the same order as the model output labels
+# Article names in model output order
 ARTICLE_NAMES = ['Art.2', 'Art.3', 'Art.5', 'Art.6', 'Art.8', 'Art.9',
                  'Art.10', 'Art.11', 'Art.14', 'P1-1']
 
-# Articles that are treated as reliable for the main summaries
+# Articles used for the main reliable summaries
 RELIABLE      = {'Art.2', 'Art.3', 'Art.5', 'Art.6', 'Art.8', 'Art.10', 'P1-1'}
 
-# EXACT copy of run_contrastive_v2.py 'targeted' active sets.
-# Gender targeted = extended (40 terms, female + male referential), pronouns kept.
+# Gender keywords
 GENDER_KEYWORDS = [
     # female-referential
     'woman', 'women', 'female', 'girl', 'mother', 'wife', 'daughter',
@@ -97,7 +84,7 @@ GENDER_KEYWORDS = [
     'grandfather', 'schoolboy', 'daddy', 'uncle', 'nephew',
 ]
 
-# Ethnicity targeted = 23 curated minority terms (no nationality adjectives).
+# Ethnicity keywords
 ETHNICITY_KEYWORDS = [
     'roma', 'romani', 'gypsy', 'kurdish', 'kurd', 'chechen',
     'jewish', 'muslim', 'christian', 'orthodox',
@@ -106,45 +93,45 @@ ETHNICITY_KEYWORDS = [
     'indigenous', 'aboriginal', 'caste',
 ]
 
-# Baseline model path and output path for the lambda sweep results
+# Model paths
 BASELINE_CKPT = os.path.join(OUTPUT_DIR, 'contrastive_baseline.pt')
 OUT_PATH      = os.path.join(OUTPUT_DIR, 'lambda_sweep_fairness.json')
 
-# Check that the baseline checkpoint exists
+# Check baseline checkpoint
 assert os.path.exists(BASELINE_CKPT), BASELINE_CKPT
 
-# Lambda sweep: evaluate every trained checkpoint against the same baseline.
+# Lambdas to evaluate
 LAMBDAS = [0.01, 0.05, 0.1, 0.5]
 
-# Build the checkpoint path for every lambda value
+# Checkpoint path for each lambda
 LAM_CKPTS = {lam: os.path.join(OUTPUT_DIR, f'contrastive_lam{lam}.pt')
              for lam in LAMBDAS}
 
-# Check that all lambda checkpoints exist
+# Check lambda checkpoints
 for lam, p in LAM_CKPTS.items():
     assert os.path.exists(p), p
 
 # -- Tokeniser + head/tail truncation ------------------------------------------
 
-# Load the Legal-BERT tokenizer
+# Load tokenizer
 TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 def tokenize_head_tail(text):
-    # Join text parts if the document is stored as a list
+    # Join text parts if needed
     if isinstance(text, list):
         text = ' '.join(text)
 
-    # Tokenize first without truncation, because truncation is done manually
+    # Tokenize first, then truncate manually
     t = TOKENIZER(text, truncation=False, add_special_tokens=True,
                   return_tensors='pt')
     ids, mask = t['input_ids'][0], t['attention_mask'][0]
 
-    # For long documents, keep the beginning and end of the text
+    # Keep the start and end for long documents
     if len(ids) > MAX_LEN:
         ids  = torch.cat([ids[:HEAD],  ids[-TAIL:]])
         mask = torch.cat([mask[:HEAD], mask[-TAIL:]])
 
-    # Pad shorter documents up to MAX_LEN
+    # Pad shorter documents
     pad = MAX_LEN - len(ids)
     if pad > 0:
         ids  = torch.cat([ids,  torch.zeros(pad, dtype=torch.long)])
@@ -158,78 +145,75 @@ class BERTClassifier(nn.Module):
     def __init__(self, num_labels=10):
         super().__init__()
 
-        # Load Legal-BERT as the encoder
+        # Encoder and classifier
         self.bert       = AutoModel.from_pretrained(MODEL_NAME)
-
-        # Final layer predicts the article labels
         self.classifier = nn.Linear(self.bert.config.hidden_size, num_labels)
 
     def forward(self, input_ids, attention_mask):
-        # Run the document through BERT
+        # Forward pass
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
 
-        # Use the CLS token as document representation
+        # Use CLS representation
         cls = out.last_hidden_state[:, 0, :]
 
         return self.classifier(cls)
 
 def load_model(path):
-    # Create the model architecture and move it to the device
+    # Build model
     m = BERTClassifier(N_LABELS).to(DEVICE)
 
-    # Load the checkpoint
+    # Load checkpoint
     ckpt = torch.load(path, map_location=DEVICE)
 
-    # Some checkpoints store the weights under model_state_dict
+    # Get weights
     sd = ckpt.get('model_state_dict', ckpt)
 
-    # Load weights and check for unexpected mismatches
+    # Load weights
     res = m.load_state_dict(sd, strict=False)
     missing = [k for k in res.missing_keys if 'position_ids' not in k]
     unexpected = list(res.unexpected_keys)
 
-    # Stop if there is a real checkpoint mismatch
+    # Stop if checkpoint does not match
     if missing or unexpected:
         raise RuntimeError(
             f'state_dict mismatch loading {path}\n'
             f'  missing={missing}\n  unexpected={unexpected}')
 
-    # Set model to evaluation mode
+    # Evaluation mode
     m.eval()
 
     return m
 
 # -- Data ----------------------------------------------------------------------
 
-# Load the ECtHR dataset
+# Load dataset
 print('Loading dataset ...')
 raw = load_dataset('coastalcph/lex_glue', 'ecthr_a', trust_remote_code=True)
 
 def split_to_arrays(split):
-    # Store tokenized inputs, labels, and text
+    # Store inputs, labels, and text
     ids, masks, labels, texts = [], [], [], []
 
-    # Process every document in the split
     for ex in split:
-        # Tokenize with head/tail truncation
+        # Tokenize document
         i, m = tokenize_head_tail(ex['text'])
         ids.append(i)
         masks.append(m)
 
-        # Create a multi-label vector for the articles
+        # Make multi-label vector
         y = np.zeros(N_LABELS, dtype=np.int64)
         for l in ex['labels']:
             if l < N_LABELS:
                 y[l] = 1
         labels.append(y)
 
-        # Store lowercased text for keyword group matching
+        # Store text for keyword matching
         texts.append((' '.join(ex['text']) if isinstance(ex['text'], list)
                      else ex['text']).lower())
 
     return (torch.stack(ids), torch.stack(masks), np.array(labels), texts)
 
-# Prepare validation and test splits
+# Prepare validation and test data
 val_ids,  val_mask,  val_y,  _          = split_to_arrays(raw['validation'])
 test_ids, test_mask, test_y, test_texts = split_to_arrays(raw['test'])
 print(f'Val: {len(val_y)} | Test: {len(test_y)}')
@@ -238,10 +222,10 @@ print(f'Val: {len(val_y)} | Test: {len(test_y)}')
 
 @torch.no_grad()
 def predict_probs(model, ids, mask, batch=16):
-    # Store probabilities for all batches
+    # Store batch probabilities
     probs = []
 
-    # Predict in batches to avoid memory issues
+    # Predict in batches
     for i in range(0, len(ids), batch):
         b_ids  = ids[i:i + batch].to(DEVICE)
         b_mask = mask[i:i + batch].to(DEVICE)
@@ -255,15 +239,15 @@ def predict_probs(model, ids, mask, batch=16):
 # -- Per-article threshold tuning on validation (maximise F1) ------------------
 
 def tune_thresholds(val_probs, val_labels):
-    # Start with default threshold 0.5 for every label
+    # Default threshold is 0.5
     thr = np.full(N_LABELS, 0.5)
 
-    # Tune one threshold per article
+    # Tune threshold per article
     for a in range(N_LABELS):
         best_f1, best_t = -1.0, 0.5
         y = val_labels[:, a]
 
-        # Try all thresholds and keep the one with best F1
+        # Try all thresholds
         for t in TAU_GRID:
             pred = (val_probs[:, a] >= t).astype(int)
             tp = int(((pred == 1) & (y == 1)).sum())
@@ -280,7 +264,7 @@ def tune_thresholds(val_probs, val_labels):
     return thr
 
 def macro_f1_reliable(pred, y):
-    # Calculate F1 for each article and then average
+    # Calculate average F1 over all articles
     f1s = []
     for a, name in enumerate(ARTICLE_NAMES):
         p, yy = pred[:, a], y[:, a]
@@ -292,15 +276,15 @@ def macro_f1_reliable(pred, y):
         f1s.append(2 * prec * rec / (prec + rec) if prec + rec else 0.0)
     return float(np.mean(f1s))
 
-# -- Group membership: EXACT whole-word regex matcher from run_contrastive_v2.py
+# -- Group membership ----------------------------------------------------------
 
 def build_keyword_pattern(keywords):
-    # Escape keywords and make one whole-word regex pattern
+    # Make one whole-word regex
     escaped = [re.escape(kw) for kw in keywords]
     return re.compile(r'\b(?:' + '|'.join(escaped) + r')\b', flags=re.IGNORECASE)
 
 def build_group_mask(texts, keywords):
-    # Mark documents as protected when they match one of the keywords
+    # Mark protected documents
     pattern = build_keyword_pattern(keywords)
     protected = np.zeros(len(texts), dtype=bool)
     for i, txt in enumerate(texts):
@@ -310,131 +294,130 @@ def build_group_mask(texts, keywords):
 # -- Vectorised fairness metrics -----------------------------------------------
 
 def dpd_di_vec(pred, prot):
-    # Split predictions into protected and unprotected groups
+    # Split protected and unprotected groups
     P, U = pred[prot], pred[~prot]
 
-    # Return NaN if one group is empty
+    # Return NaN if a group is empty
     if P.shape[0] == 0 or U.shape[0] == 0:
         nan = np.full(N_LABELS, np.nan)
         return nan, nan
 
-    # Positive prediction rate for both groups
+    # Positive rates
     p_prot, p_unp = P.mean(0), U.mean(0)
 
-    # DPD is the absolute gap between the two groups
+    # Demographic parity difference
     dpd = np.abs(p_prot - p_unp)
 
-    # DI is the ratio between protected and unprotected positive rates
+    # Disparate impact
     with np.errstate(divide='ignore', invalid='ignore'):
         di = np.where(p_unp > 0, p_prot / p_unp, np.nan)
 
     return dpd, di
 
 def eod_vec(pred, y, prot):
-    # Convert predictions to float for metric calculation
+    # Convert predictions for calculations
     pred = pred.astype(float)
 
     def grp(mask_rows):
-        # Select true positives and true negatives for the group
+        # Select rows for this group
         pos = (y == 1) & mask_rows[:, None]
         neg = (y == 0) & mask_rows[:, None]
 
-        # Calculate true positive rate and false positive rate
+        # Calculate TPR and FPR
         with np.errstate(divide='ignore', invalid='ignore'):
             tpr = (pred * pos).sum(0) / pos.sum(0)
             fpr = (pred * neg).sum(0) / neg.sum(0)
 
         return tpr, fpr
 
-    # Calculate rates for protected and unprotected groups
+    # Compare protected and unprotected rates
     tpr_p, fpr_p = grp(prot)
     tpr_u, fpr_u = grp(~prot)
 
-    # EOD takes the larger gap between TPR and FPR gaps
+    # Equalized odds difference
     d_tpr = np.abs(tpr_p - tpr_u)
     d_fpr = np.abs(fpr_p - fpr_u)
     return np.fmax(d_tpr, d_fpr)
 
 # -- Load models and compute test predictions ---------------------------------
 
-# Load the baseline only once because it is compared to every lambda
+# Load baseline
 print('\nLoading baseline once ...')
 base_model = load_model(BASELINE_CKPT)
 
-# Tune baseline thresholds on the validation set
+# Baseline thresholds
 print('Scoring validation for baseline thresholds ...')
 val_probs_base = predict_probs(base_model, val_ids, val_mask)
 thr_base = tune_thresholds(val_probs_base, val_y)
 
-# Get baseline predictions on the test set
+# Baseline test predictions
 print('Scoring test for baseline ...')
 test_probs_base = predict_probs(base_model, test_ids, test_mask)
 pred_base = (test_probs_base >= thr_base).astype(int)
 
-# Baseline performance check
+# Baseline F1
 f1_base = macro_f1_reliable(pred_base, test_y)
 print(f'Baseline macro F1 (all-10 mean): {f1_base:.4f}')
 
-# Protected group axes to evaluate
+# Group axes
 AXES = {'gender': GENDER_KEYWORDS, 'ethnicity': ETHNICITY_KEYWORDS}
 
 def percentile_ci(arr):
-    # Calculate 95% bootstrap percentile confidence interval
+    # 95% percentile CI
     lo, hi = np.nanpercentile(arr, [2.5, 97.5], axis=0)
     return lo, hi
 
 def _num(x):
-    # Convert NaN to None for cleaner JSON output
+    # Convert NaN to None for JSON
     return None if (x is None or (isinstance(x, float) and np.isnan(x))) else float(x)
 
 # Number of test examples
 n = len(test_y)
 
-# Store the full lambda sweep results
+# Store results
 sweep = {}
 
-# Evaluate every lambda checkpoint
+# Evaluate each lambda
 for lam in LAMBDAS:
     print(f'\n========== lambda = {lam} ==========')
 
-    # Load the SCM model for this lambda
+    # Load SCM model
     scm_model = load_model(LAM_CKPTS[lam])
 
-    # Tune thresholds for this SCM model
+    # SCM thresholds
     val_probs_scm = predict_probs(scm_model, val_ids, val_mask)
     thr_scm = tune_thresholds(val_probs_scm, val_y)
 
-    # Predict on the test set
+    # SCM test predictions
     test_probs_scm = predict_probs(scm_model, test_ids, test_mask)
     pred_scm = (test_probs_scm >= thr_scm).astype(int)
 
-    # Print performance for this lambda
+    # SCM performance
     f1_scm = macro_f1_reliable(pred_scm, test_y)
     print(f'lambda={lam}  macro F1={f1_scm:.4f}  (baseline {f1_base:.4f})')
 
     results = {}
 
-    # Reset rng to SEED before each lambda so all lambdas share the SAME
-    # bootstrap resamples against the SAME baseline -> comparable CIs.
+    # Use the same bootstrap samples for each lambda
     rng = np.random.default_rng(SEED)
 
-    # Run fairness metrics for gender and ethnicity
+    # Run both fairness axes
     for axis, kw in AXES.items():
-        # Build protected/unprotected mask
+        # Protected group mask
         prot = build_group_mask(test_texts, kw)
         n_p, n_u = int(prot.sum()), int((~prot).sum())
         print(f'  {axis}: protected={n_p}  unprotected={n_u}')
 
-        # Point estimates for baseline and SCM
+        # Point estimates
         dpd_b0, di_b0 = dpd_di_vec(pred_base, prot)
         dpd_s0, di_s0 = dpd_di_vec(pred_scm,  prot)
         eod_b0 = eod_vec(pred_base, test_y, prot)
         eod_s0 = eod_vec(pred_scm,  test_y, prot)
 
-        # Change in DPD from baseline to SCM
+        # Change in DPD
         delta0 = dpd_s0 - dpd_b0
 
-        # Bootstrap arrays for confidence intervals
+        # Bootstrap storage
         boot = {k: np.full((N_BOOT, N_LABELS), np.nan)
                 for k in ['dpd_b', 'dpd_s', 'delta', 'di_b', 'di_s', 'eod_b', 'eod_s']}
 
@@ -443,11 +426,11 @@ for lam in LAMBDAS:
             # Sample test examples with replacement
             idx = rng.integers(0, n, size=n)
 
-            # Apply the same resample to groups, predictions, and labels
+            # Apply the sample
             prot_b = prot[idx]
             pb, ps, yb = pred_base[idx], pred_scm[idx], test_y[idx]
 
-            # Recalculate fairness metrics on the resampled data
+            # Recompute fairness metrics
             d_b, i_b = dpd_di_vec(pb, prot_b)
             d_s, i_s = dpd_di_vec(ps, prot_b)
 
@@ -458,16 +441,16 @@ for lam in LAMBDAS:
             boot['eod_b'][b] = eod_vec(pb, yb, prot_b)
             boot['eod_s'][b] = eod_vec(ps, yb, prot_b)
 
-        # Convert bootstrap samples into confidence intervals
+        # Confidence intervals
         ci = {k: percentile_ci(v) for k, v in boot.items()}
 
-        # Store article-level results
+        # Article-level results
         axis_res = {}
         for a, name in enumerate(ARTICLE_NAMES):
             lo, hi = ci['delta'][0][a], ci['delta'][1][a]
             rel = name in RELIABLE
 
-            # Check whether the delta-DPD CI includes zero
+            # Check if CI contains zero
             crosses_zero = bool(lo <= 0 <= hi) if not (np.isnan(lo) or np.isnan(hi)) else None
 
             axis_res[name] = {
@@ -484,14 +467,14 @@ for lam in LAMBDAS:
                 'eod_scm': _num(eod_s0[a]),
             }
 
-        # reliable-only macro means for this axis/lambda
+        # Reliable-article averages
         rel_idx = [i for i, nm in enumerate(ARTICLE_NAMES) if nm in RELIABLE]
         mean_dpd_base = float(np.nanmean([dpd_b0[i] for i in rel_idx]))
         mean_dpd_scm  = float(np.nanmean([dpd_s0[i] for i in rel_idx]))
         mean_eod_base = float(np.nanmean([eod_b0[i] for i in rel_idx]))
         mean_eod_scm  = float(np.nanmean([eod_s0[i] for i in rel_idx]))
 
-        # Save axis-level summary and article-level details
+        # Save axis results
         results[axis] = {
             'n_protected': n_p,
             'n_unprotected': n_u,
@@ -502,7 +485,7 @@ for lam in LAMBDAS:
             'articles': axis_res,
         }
 
-    # Save everything for this lambda
+    # Save lambda results
     sweep[str(lam)] = {
         'lambda': float(lam),
         'macro_f1_all10': {'baseline': f1_base, 'scm': f1_scm},
@@ -510,7 +493,7 @@ for lam in LAMBDAS:
         'results': results,
     }
 
-# Metadata so the JSON output is clear later
+# Metadata for the output file
 meta = {
     'seed': SEED,
     'pairs': args.pairs,
@@ -523,10 +506,10 @@ meta = {
     'ethnicity_keywords': ETHNICITY_KEYWORDS,
 }
 
-# Final output object
+# Final output
 out = {'meta': meta, 'sweep': sweep}
 
-# Save the lambda sweep fairness results
+# Save results
 with open(OUT_PATH, 'w') as f:
     json.dump(out, f, indent=2)
 
