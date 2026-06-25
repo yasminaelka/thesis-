@@ -1,22 +1,10 @@
 """
-recompute_iw_fairness_corrected.py
-----------------------------------
-Recomputes the Appendix E (instance-weighted) per-article DPD under the
-CORRECTED whole-word keyword grouping (gender 931/69, ethnicity 136/864),
-replacing the stale 978/22 grouping in instance_weighted_fairness.json.
+Recompute corrected instance-weighted fairness results.
 
-No retraining: loads the saved IW lambda=0.5 checkpoint and the seed-42
-baseline checkpoint, tunes per-article thresholds per model on validation,
-applies the corrected grouping, and prints per-article DPD for the seven
-reliable articles on both axes.
-
-All metric / grouping / threshold / tokenisation logic is copied verbatim
-from fairness_ci_eod_multiseed.py so the numbers are directly comparable to
-the rest of the thesis.
-
-Run on a gpu_a100 node:
-  python recompute_iw_fairness_corrected.py
+This script loads the saved IW model and the seed-42 baseline, applies the
+corrected whole-word group matching, and prints per-article DPD results.
 """
+
 import os, re, json, warnings
 warnings.filterwarnings('ignore')
 import numpy as np
@@ -43,7 +31,8 @@ ARTICLE_NAMES = ['Art.2', 'Art.3', 'Art.5', 'Art.6', 'Art.8', 'Art.9',
                  'Art.10', 'Art.11', 'Art.14', 'P1-1']
 RELIABLE      = {'Art.2', 'Art.3', 'Art.5', 'Art.6', 'Art.8', 'Art.10', 'P1-1'}
 
-# -- keyword lists: verbatim from fairness_ci_eod_multiseed.py (lines 75-92) ---
+# -- keyword lists -------------------------------------------------------------
+
 GENDER_KEYWORDS = [
     'woman', 'women', 'female', 'girl', 'mother', 'wife', 'daughter',
     'sister', 'she', 'her', 'hers', 'lady', 'bride', 'girlfriend',
@@ -60,7 +49,8 @@ ETHNICITY_KEYWORDS = [
     'indigenous', 'aboriginal', 'caste',
 ]
 
-# -- tokeniser + head/tail truncation (verbatim) -------------------------------
+# -- tokeniser + head/tail truncation ------------------------------------------
+
 TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 def tokenize_head_tail(text):
@@ -77,7 +67,8 @@ def tokenize_head_tail(text):
         mask = torch.cat([mask, torch.zeros(pad, dtype=torch.long)])
     return ids, mask
 
-# -- model (verbatim from run_contrastive_v2.py) -------------------------------
+# -- model ---------------------------------------------------------------------
+
 class BERTClassifier(nn.Module):
     def __init__(self, num_labels=10):
         super().__init__()
@@ -119,7 +110,8 @@ def tune_thresholds(val_probs, val_labels):
         thr[a] = best_t
     return thr
 
-# -- grouping + DPD (verbatim) -------------------------------------------------
+# -- grouping + DPD ------------------------------------------------------------
+
 def build_keyword_pattern(keywords):
     escaped = [re.escape(kw) for kw in keywords]
     return re.compile(r'\b(?:' + '|'.join(escaped) + r')\b', flags=re.IGNORECASE)
@@ -142,7 +134,8 @@ def dpd_di_vec(pred, prot):
         di = np.where(p_unp > 0, p_prot / p_unp, np.nan)
     return dpd, di
 
-# -- data (text built EXACTLY as in fairness_ci_eod_multiseed.py) --------------
+# -- data ----------------------------------------------------------------------
+
 print('Loading ECtHR ecthr_a ...')
 raw = load_dataset('coastalcph/lex_glue', 'ecthr_a', trust_remote_code=True)
 
@@ -166,6 +159,7 @@ test_ids, test_mask, test_y, test_texts = split_to_arrays(raw['test'])
 print(f'Val: {len(val_y)} | Test: {len(test_y)}')
 
 # -- score both models ---------------------------------------------------------
+
 print('Loading models ...')
 base_model = load_model(BASELINE_CKPT)
 iw_model   = load_model(IW_CKPT)
@@ -179,6 +173,7 @@ pred_base = (predict_probs(base_model, test_ids, test_mask) >= thr_base).astype(
 pred_iw   = (predict_probs(iw_model,   test_ids, test_mask) >= thr_iw  ).astype(int)
 
 # -- corrected grouping + per-article DPD --------------------------------------
+
 AXES = {'gender': GENDER_KEYWORDS, 'ethnicity': ETHNICITY_KEYWORDS}
 print('\n=== Corrected-grouping instance-weighted DPD (seed 42, lambda=0.5) ===')
 summary = {}

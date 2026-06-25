@@ -1,29 +1,17 @@
+```
 """
-Contrastive SCM Fairness — Full Training & Evaluation Script
-Yasmina El Kacemi — University of Amsterdam
+Contrastive SCM fairness training and evaluation.
 
-Trains:
-  1. Baseline LegalBERT (no regularisation)
-  2. Contrastive SCM model (best lambda selected on validation)
+This script trains a baseline model and a contrastive SCM model, then evaluates
+performance, fairness, and SHAP faithfulness.
 
-Evaluates all three dimensions:
-  - Predictive performance (macro F1)
-  - Fairness (DPD, DI) — separate gender and ethnicity groups
-  - Explanation faithfulness (SHAP sufficiency, comprehensiveness)
-
-Architecture matches fix-problem-scm-loss.ipynb exactly.
-
-Multi-seed usage:
-  python run_contrastive.py --seed 42            # full pipeline incl. SHAP
-  python run_contrastive.py --seed 13 --skip_shap  # training + fairness only
-
-The --seed flag sets all RNGs and writes to a per-seed output folder so runs
-never overwrite each other. --skip_shap skips the expensive Phase 5 so
-training + fairness can be swept cheaply across many seeds, with SHAP
-faithfulness run on only a subset of seeds.
+Different seeds, encoders, pair sets, and keyword sets can be selected from the
+command line.
 """
 
 import os, json, random, time, warnings, argparse, re
+
+# Keep the terminal output cleaner
 warnings.filterwarnings('ignore')
 
 import numpy as np
@@ -38,41 +26,38 @@ from sklearn.metrics import f1_score
 import shap
 
 # ── Command-line arguments ──────────────────────────────────────────────────────
-# Seed is now a CLI argument so a SLURM job array can sweep several seeds.
-# --skip_shap lets cheap runs (training + fairness only) skip the costly
-# SHAP faithfulness phase; run SHAP on a small subset of seeds instead.
+
+# Settings for running the script
 parser = argparse.ArgumentParser(description='Contrastive SCM fairness training')
 parser.add_argument('--seed', type=int, default=42,
                     help='Random seed for all RNGs (default: 42)')
 parser.add_argument('--skip_shap', action='store_true',
                     help='Skip Phase 5 SHAP faithfulness (for cheap multi-seed runs)')
-# --- New: broader baselines (committee point 4) ---
-# Encoder lets the same pipeline run LegalBERT, vanilla BERT, or RoBERTa, so
-# the "is the effect specific to LegalBERT?" question can be answered.
+
+# Encoder choice
 parser.add_argument('--encoder', type=str, default='legal-bert',
                     choices=['legal-bert', 'bert', 'roberta'],
                     help='Backbone encoder (default: legal-bert)')
-# --- New: SCM-specificity control (committee point 3) ---
-# The regularised arm can use the real SCM antonym pairs, the same words with
-# the pairings SHUFFLED (vocabulary held constant, antonym structure broken),
-# or RANDOM vocabulary pairs. If 'shuffled'/'random' reproduces the same
-# downstream effect as 'scm', the effect is NOT specific to the SCM construct.
+
+# Pair set for the contrastive loss
 parser.add_argument('--pairs', type=str, default='scm',
                     choices=['scm', 'shuffled', 'random'],
                     help='Pair set for the regularised arm (default: scm)')
-# --- New: keyword set selection (Sahand / fairness proxy point) ---
+
+# Keyword set for fairness groups
 parser.add_argument('--keyword_set', type=str, default='targeted',
                     choices=['original', 'extended', 'targeted'],
                     help='Active demographic keyword set for fairness (default: targeted)')
-# --- New: fast end-to-end validation before launching on SLURM ---
+
+# Small run to test the full script
 parser.add_argument('--smoke_test', action='store_true',
                     help='Tiny subset, 1 epoch, single lambda, 4 SHAP docs. '
                          'Use to verify the script runs end-to-end in minutes.')
 args = parser.parse_args()
 
 # ── Reproducibility ────────────────────────────────────────────────────────────
-# Every RNG is seeded from the CLI value so each run in the array is
-# reproducible and the seeds are clearly separated on disk.
+
+# Set seeds so runs are repeatable
 SEED = args.seed
 random.seed(SEED)
 np.random.seed(SEED)
@@ -80,14 +65,15 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 print(f'Seed: {SEED}')
 
+# Use GPU if available
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f'Device: {DEVICE}')
 if DEVICE == 'cuda':
     print(f'GPU   : {torch.cuda.get_device_name(0)}')
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-# Encoder choice (committee point 4). Output is keyed by encoder + pair set +
-# seed so no two runs in the campaign ever overwrite each other.
+
+# Model name for each encoder option
 ENCODER_MODELS = {
     'legal-bert': 'nlpaueb/legal-bert-base-uncased',
     'bert'      : 'bert-base-uncased',
@@ -96,6 +82,8 @@ ENCODER_MODELS = {
 MODEL_NAME   = ENCODER_MODELS[args.encoder]
 RUN_TAG      = f'{args.encoder}_{args.pairs}_seed{SEED}'
 OUTPUT_DIR   = f'/gpfs/home6/yelkacemi/output/{RUN_TAG}'
+
+# Main training settings
 N_LABELS     = 10
 MAX_LEN      = 512
 HEAD         = 256
@@ -112,14 +100,11 @@ K_VALUES     = [0.01, 0.05, 0.10]
 ARTICLE_NAMES = ['Art.2','Art.3','Art.5','Art.6','Art.8','Art.9',
                  'Art.10','Art.11','Art.14','P1-1']
 
-# Reliability is now DERIVED from an explicit rule, not hardcoded.
-# RELIABILITY_BASIS documents exactly what the threshold counts, which is the
-# clarification the committee asked for. 'test_pos' = ground-truth positive
-# labels in the test set (the Table 1 numbers).
+# Rule for deciding which articles are reliable
 RELIABILITY_BASIS = 'test_pos'     # 'test_pos' | 'pred_pos' | 'protected_pos'
 MIN_RELIABLE      = 30             # articles with >= this many are 'reliable'
 
-# Smoke test: shrink everything so the full pipeline runs in minutes on CPU.
+# Smaller setup for a quick test run
 if args.smoke_test:
     N_EPOCHS    = 1
     LAMBDAS     = [0.1]
@@ -128,15 +113,17 @@ if args.smoke_test:
     OUTPUT_DIR  = f'./smoke_output/{RUN_TAG}'
     print('*** SMOKE TEST: tiny subset, 1 epoch, 1 lambda, 4 SHAP docs ***')
 
+# Print run settings
 print(f'Encoder   : {args.encoder} ({MODEL_NAME})')
 print(f'Pair set  : {args.pairs}')
 print(f'Run tag   : {RUN_TAG}')
 
+# Create output folder
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ── SCM antonym pairs (from notebook) ─────────────────────────────────────────
-# ── SCM pairs: exactly matching unified_scm_notebook_1 ───────────────────────
-# 14 original warmth pairs (Omrani et al., ACL 2023 / Fiske et al., 2002)
+# ── SCM antonym pairs ──────────────────────────────────────────────────────────
+
+# Warmth pairs
 WARMTH_PAIRS_ORIGINAL = [
     ('sincere',       'dishonest'),
     ('trustworthy',   'untrustworthy'),
@@ -153,7 +140,8 @@ WARMTH_PAIRS_ORIGINAL = [
     ('honest',        'deceptive'),
     ('loyal',         'disloyal'),
 ]
-# 5 W&C-Sent enrichment pairs (Ayesh et al., 2026)
+
+# Extra warmth pairs
 WARMTH_PAIRS_WC_SENT = [
     ('trustful',     'suspicious'),
     ('sociable',     'antisocial'),
@@ -161,7 +149,8 @@ WARMTH_PAIRS_WC_SENT = [
     ('respectful',   'disrespectful'),
     ('well-meaning', 'ill-intentioned'),
 ]
-# 14 original competence pairs
+
+# Competence pairs
 COMPETENCE_PAIRS_ORIGINAL = [
     ('intelligent',   'stupid'),
     ('capable',       'incapable'),
@@ -178,7 +167,8 @@ COMPETENCE_PAIRS_ORIGINAL = [
     ('experienced',   'inexperienced'),
     ('reliable',      'unreliable'),
 ]
-# 5 W&C-Sent competence enrichment pairs
+
+# Extra competence pairs
 COMPETENCE_PAIRS_WC_SENT = [
     ('systematic',  'haphazard'),
     ('methodical',  'chaotic'),
@@ -186,29 +176,19 @@ COMPETENCE_PAIRS_WC_SENT = [
     ('thorough',    'careless'),
     ('coherent',    'incoherent'),
 ]
+
+# Combine all SCM pairs
 ALL_WARMTH_PAIRS     = WARMTH_PAIRS_ORIGINAL     + WARMTH_PAIRS_WC_SENT
 ALL_COMPETENCE_PAIRS = COMPETENCE_PAIRS_ORIGINAL + COMPETENCE_PAIRS_WC_SENT
 SCM_PAIRS = ALL_WARMTH_PAIRS + ALL_COMPETENCE_PAIRS
 print(f'Total SCM pairs: {len(SCM_PAIRS)} ({len(ALL_WARMTH_PAIRS)} warmth + {len(ALL_COMPETENCE_PAIRS)} competence)')
 
 # ── Demographic keywords ───────────────────────────────────────────────────────
-# Two keyword sets are defined. The ACTIVE set used for the fairness analysis
-# is selected by KEYWORD_SET below.
-#
-#  - "original": the initial narrow lists used in the first draft.
-#  - "extended": the fuller validated lexicon adopted from Choenni et al.
-#    (2021, EMNLP) and mirrored in Kocadag (2025, Fig. 3). Broadening the
-#    lists addresses the weak-proxy / small-protected-group concern raised
-#    in supervisor feedback. This change is disclosed and cited in the
-#    methodology; the original lists are retained for a robustness comparison.
-#
-# NOTE: changing the active set changes which test documents fall into the
-# protected groups, and therefore changes all downstream fairness numbers
-# (DPD, DI, ΔDPD). Re-run the full fairness phase after switching.
 
+# Choose the keyword set for the main fairness results
 KEYWORD_SET = args.keyword_set   # 'original' | 'extended' | 'targeted'
 
-# --- Original (first-draft) lists -----------------------------------------------
+# Original keyword lists
 GENDER_KEYWORDS_ORIGINAL = [
     'woman', 'women', 'female', 'girl', 'mother', 'wife',
     'daughter', 'sister', 'she', 'her', 'hers',
@@ -218,9 +198,7 @@ ETHNICITY_KEYWORDS_ORIGINAL = [
     'refugee', 'immigrant', 'minority', 'ethnic',
 ]
 
-# --- Extended lists (Choenni et al. 2021; Kocadag 2025, Fig. 3) ------------------
-# Gender: now includes male-referential and additional kinship/role terms, so
-# the group captures gender-referential text rather than only female terms.
+# Extended gender list
 GENDER_KEYWORDS_EXTENDED = [
     # female-referential
     'woman', 'women', 'female', 'girl', 'mother', 'wife', 'daughter',
@@ -231,8 +209,8 @@ GENDER_KEYWORDS_EXTENDED = [
     'he', 'him', 'his', 'gentleman', 'groom', 'boyfriend', 'stepfather',
     'grandfather', 'schoolboy', 'daddy', 'uncle', 'nephew',
 ]
-# Ethnicity/nationality: broadened to the validated nationality + ethnicity
-# term list rather than only asylum/minority vocabulary.
+
+# Extended ethnicity list
 ETHNICITY_KEYWORDS_EXTENDED = [
     'roma', 'romani', 'kurdish', 'kurd', 'chechen', 'asylum', 'refugee',
     'immigrant', 'minority', 'ethnic', 'european', 'jewish', 'russian',
@@ -247,16 +225,7 @@ ETHNICITY_KEYWORDS_EXTENDED = [
     'lebanese',
 ]
 
-# --- Targeted ethnicity list (Sahand / construct-validity fix) -------------------
-# The 'extended' list above mixes ethnicity/minority terms with nationality
-# adjectives (european, american, british, french, ...). Respondent states are
-# named in almost every ECtHR judgment, so those adjectives match ~50% of docs
-# and the "protected" group stops being a minority. The TARGETED list keeps only
-# ethnicity / minority-status terms and drops nationality adjectives, yielding a
-# genuine minority subgroup (~14% of the test set).
-# NOTE: reconcile this against your validated Choenni et al. (2021) / Omrani et
-# al. (2023) lists before final submission; it should be your validated list,
-# not an ad-hoc one chosen for its group size.
+# Targeted ethnicity list
 ETHNICITY_KEYWORDS_TARGETED = [
     'roma', 'romani', 'gypsy', 'kurdish', 'kurd', 'chechen',
     'jewish', 'muslim', 'christian', 'orthodox',
@@ -265,12 +234,10 @@ ETHNICITY_KEYWORDS_TARGETED = [
     'indigenous', 'aboriginal', 'caste',
 ]
 
-# Gender keeps pronouns (Sahand's decision): pronouns carry genuine gender
-# information in legal text, and we prioritise construct validity over a
-# favourable group balance even though this leaves the split near-even.
+# Targeted gender uses the extended gender list
 GENDER_KEYWORDS_TARGETED = GENDER_KEYWORDS_EXTENDED
 
-# Select the active sets used everywhere downstream.
+# Select active keyword lists
 if KEYWORD_SET == 'extended':
     GENDER_KEYWORDS    = GENDER_KEYWORDS_EXTENDED
     ETHNICITY_KEYWORDS = ETHNICITY_KEYWORDS_EXTENDED
@@ -281,8 +248,7 @@ else:
     GENDER_KEYWORDS    = GENDER_KEYWORDS_ORIGINAL
     ETHNICITY_KEYWORDS = ETHNICITY_KEYWORDS_ORIGINAL
 
-# All sets kept addressable so fairness can be reported across them in one run
-# (robustness of the null to the group definition).
+# Keep all keyword sets for comparison
 KEYWORD_SETS = {
     'original': {'gender': GENDER_KEYWORDS_ORIGINAL, 'ethnicity': ETHNICITY_KEYWORDS_ORIGINAL},
     'extended': {'gender': GENDER_KEYWORDS_EXTENDED, 'ethnicity': ETHNICITY_KEYWORDS_EXTENDED},
@@ -290,15 +256,12 @@ KEYWORD_SETS = {
 }
 
 def build_keyword_pattern(keywords):
-    """One case-insensitive regex matching any keyword as a WHOLE word, so
-    'male' does not match inside 'female' and 'her' does not match inside
-    'there'. Multi-word terms are escaped safely."""
+    """Build one whole-word regex for a keyword list."""
     escaped = [re.escape(kw) for kw in keywords]
     return re.compile(r'\b(?:' + '|'.join(escaped) + r')\b', flags=re.IGNORECASE)
 
 def get_group_indices(hf_split, keywords):
-    """Split a dataset split into protected / unprotected index arrays by
-    whole-word presence of any demographic keyword in the document text."""
+    """Split documents into protected and unprotected groups."""
     pattern = build_keyword_pattern(keywords)
     protected, unprotected = [], []
     for idx, example in enumerate(hf_split):
@@ -310,16 +273,14 @@ print(f'Keyword set: {KEYWORD_SET} '
       f'(gender={len(GENDER_KEYWORDS)}, ethnicity={len(ETHNICITY_KEYWORDS)})')
 
 # ── Tokenizer & Dataset ────────────────────────────────────────────────────────
+
 print('Loading tokenizer ...')
 TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-# ── Active pair set + control conditions (committee point 3) ───────────────────
-# 'scm'      : real warmth/competence antonym pairs (the treatment).
-# 'shuffled' : same words, pairings permuted -> antonym structure destroyed,
-#              vocabulary identical. Best control for "is it the SCM construct?".
-# 'random'   : random vocabulary pairs, same count. Control for "any auxiliary
-#              contrastive term".
+# ── Active pair set ────────────────────────────────────────────────────────────
+
 def _build_active_pairs(mode):
+    # Select which pair set to use
     if mode == 'scm':
         return list(SCM_PAIRS)
     rng = random.Random(SEED)              # deterministic, independent of globals
@@ -329,7 +290,7 @@ def _build_active_pairs(mode):
         rng.shuffle(neg)
         return list(zip(pos, neg))
     if mode == 'random':
-        # sample clean alphabetic whole-word tokens from the vocabulary
+        # Sample random clean words from the tokenizer vocabulary
         vocab = [w for w in TOKENIZER.get_vocab()
                  if w.lstrip('Ġ▁##').isalpha() and len(w.lstrip('Ġ▁##')) >= 3]
         words = rng.sample(vocab, 2 * len(SCM_PAIRS))
@@ -340,28 +301,31 @@ def _build_active_pairs(mode):
 ACTIVE_PAIRS = _build_active_pairs(args.pairs)
 
 def _word_token_ids(word):
-    """Token ids for a word, robust across WordPiece and BPE tokenizers.
-    Encodes both the bare word and a leading-space variant, because BPE
-    (RoBERTa) represents mid-sentence words with a leading-space marker."""
+    """Get token ids for one word."""
     ids = set()
     for variant in (word, ' ' + word):
         ids.update(TOKENIZER.encode(variant, add_special_tokens=False))
     return torch.tensor(sorted(ids), dtype=torch.long)
 
-# Precompute once (also avoids re-encoding every pair on every batch).
+# Precompute token IDs for the active pairs
 PAIR_ID_SETS = [(_word_token_ids(p), _word_token_ids(n)) for p, n in ACTIVE_PAIRS]
 print(f'Active pair set: {args.pairs} ({len(ACTIVE_PAIRS)} pairs)')
 
 def tokenize_head_tail(text):
+    # Join document parts if needed
     if isinstance(text, list):
         text = ' '.join(text)
     tokens = TOKENIZER(text, truncation=False, add_special_tokens=True,
                        return_tensors='pt')
     ids  = tokens['input_ids'][0]
     mask = tokens['attention_mask'][0]
+
+    # Use head-tail truncation for long documents
     if len(ids) > MAX_LEN:
         ids  = torch.cat([ids[:HEAD],  ids[-TAIL:]])
         mask = torch.cat([mask[:HEAD], mask[-TAIL:]])
+
+    # Pad shorter documents
     pad_len = MAX_LEN - len(ids)
     if pad_len > 0:
         ids  = torch.cat([ids,  torch.zeros(pad_len, dtype=torch.long)])
@@ -374,6 +338,7 @@ class ECTHRDataset(Dataset):
     def __len__(self):
         return len(self.data)
     def __getitem__(self, idx):
+        # Return tokenized text and labels
         example = self.data[idx]
         input_ids, attention_mask = tokenize_head_tail(example['text'])
         label_vector = torch.zeros(N_LABELS)
@@ -387,6 +352,8 @@ class ECTHRDataset(Dataset):
 
 print('Loading dataset ...')
 raw          = load_dataset('coastalcph/lex_glue', 'ecthr_a')
+
+# Use small splits for smoke test
 if args.smoke_test:
     raw = {
         'train'     : raw['train'].select(range(64)),
@@ -394,6 +361,8 @@ if args.smoke_test:
         'test'      : raw['test'].select(range(64)),
     }
     print('Smoke test: train=64, val=32, test=64')
+
+# Create datasets and dataloaders
 train_dataset = ECTHRDataset(raw['train'])
 val_dataset   = ECTHRDataset(raw['validation'])  # LexGLUE uses 'validation'
 test_dataset  = ECTHRDataset(raw['test'])
@@ -403,10 +372,14 @@ test_loader   = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False)
 print(f'Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}')
 
 # ── Class weights ──────────────────────────────────────────────────────────────
+
+# Count positive labels in the training set
 pos_counts = np.zeros(N_LABELS)
 for example in raw['train']:
     for label in example['labels']:
         pos_counts[label] += 1
+
+# Build class weights
 N            = len(raw['train'])
 neg_counts   = N - pos_counts
 raw_weights  = np.log1p(neg_counts / np.maximum(pos_counts, 1))
@@ -415,15 +388,19 @@ CLASS_WEIGHTS = torch.tensor(log_weights, dtype=torch.float).to(DEVICE)
 print('Class weights computed.')
 
 # ── Model ──────────────────────────────────────────────────────────────────────
+
 class BERTClassifier(nn.Module):
     def __init__(self, num_labels=10):
         super().__init__()
+        # Encoder and classifier head
         self.bert       = AutoModel.from_pretrained(MODEL_NAME)
         self.classifier = nn.Linear(self.bert.config.hidden_size, num_labels)
 
     def forward(self, input_ids, attention_mask, output_hidden_states=False):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask,
                             output_hidden_states=output_hidden_states)
+
+        # Use CLS representation
         cls    = outputs.last_hidden_state[:, 0, :]
         logits = self.classifier(cls)
         result = {'logits': logits}
@@ -432,7 +409,9 @@ class BERTClassifier(nn.Module):
         return result
 
 # ── Evaluation helpers ─────────────────────────────────────────────────────────
+
 def get_probabilities(model, loader):
+    # Get probabilities and labels
     model.eval()
     all_probs, all_labels = [], []
     with torch.no_grad():
@@ -446,6 +425,7 @@ def get_probabilities(model, loader):
     return np.vstack(all_probs), np.vstack(all_labels)
 
 def tune_thresholds(probs, labels):
+    # Tune one threshold per label
     thresholds = []
     for i in range(N_LABELS):
         best_t, best_f1 = 0.5, 0.0
@@ -458,6 +438,7 @@ def tune_thresholds(probs, labels):
     return thresholds
 
 def evaluate_f1(model, loader, thresholds=None):
+    # Evaluate macro F1
     probs, labels = get_probabilities(model, loader)
     if thresholds is None:
         thresholds = [0.5] * N_LABELS
@@ -467,7 +448,9 @@ def evaluate_f1(model, loader, thresholds=None):
     return f1_score(labels, preds, average='macro', zero_division=0)
 
 # ── Contrastive SCM loss ───────────────────────────────────────────────────────
+
 def compute_scm_loss_contrastive(hidden_states, input_ids, pair_id_sets, margin=0.5):
+    # Compute loss for pairs that appear in the batch
     losses = []
     for pos_tensor, neg_tensor in pair_id_sets:
         pos_tensor = pos_tensor.to(input_ids.device)
@@ -481,12 +464,16 @@ def compute_scm_loss_contrastive(hidden_states, input_ids, pair_id_sets, margin=
                 sim   = F.cosine_similarity(h_pos.unsqueeze(0), h_neg.unsqueeze(0))
                 loss  = torch.clamp(sim + margin, min=0.0)
                 losses.append(loss)
+
+    # Return zero if there are no pair matches
     if len(losses) == 0:
         return torch.tensor(0.0, device=input_ids.device, requires_grad=True)
     return torch.stack(losses).mean()
 
 # ── Training loop ──────────────────────────────────────────────────────────────
+
 def train_epoch(model, loader, optimizer, lam=0.0, use_scm=False):
+    # Train for one epoch
     model.train()
     total_loss, total_ce, total_scm = 0.0, 0.0, 0.0
     for batch_idx, batch in enumerate(loader):
@@ -495,8 +482,12 @@ def train_epoch(model, loader, optimizer, lam=0.0, use_scm=False):
         labels = batch['labels'].to(DEVICE)
         out    = model(ids, mask, output_hidden_states=use_scm)
         logits = out['logits']
+
+        # Main classification loss
         ce_loss = F.binary_cross_entropy_with_logits(
             logits, labels, pos_weight=CLASS_WEIGHTS)
+
+        # Add SCM loss when needed
         if use_scm:
             hs      = out['hidden_states'][-1]
             scm_loss = compute_scm_loss_contrastive(hs, ids, PAIR_ID_SETS, MARGIN)
@@ -504,12 +495,16 @@ def train_epoch(model, loader, optimizer, lam=0.0, use_scm=False):
         else:
             scm_loss = torch.tensor(0.0)
             loss     = ce_loss
+
+        # Update model
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
         total_ce   += ce_loss.item()
         total_scm  += scm_loss.item()
+
+        # Print progress
         if (batch_idx + 1) % 200 == 0:
             print(f'  Batch {batch_idx+1}/{len(loader)} | '
                   f'Total: {loss.item():.4f} | '
@@ -519,6 +514,7 @@ def train_epoch(model, loader, optimizer, lam=0.0, use_scm=False):
     return total_loss/n, total_ce/n, total_scm/n
 
 def train_model(save_path, lam=0.0, use_scm=False, label=''):
+    # Train one model and save the best version
     print(f'\n{"="*55}')
     print(f'Training: {label}')
     print(f'{"="*55}')
@@ -526,6 +522,7 @@ def train_model(save_path, lam=0.0, use_scm=False, label=''):
     model     = BERTClassifier(N_LABELS).to(DEVICE)
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
     best_val_f1, patience_cnt = 0.0, 0
+
     for epoch in range(N_EPOCHS):
         print(f'\nEpoch {epoch+1}/{N_EPOCHS}')
         train_loss, ce_loss, scm_loss = train_epoch(
@@ -533,6 +530,8 @@ def train_model(save_path, lam=0.0, use_scm=False, label=''):
         val_f1 = evaluate_f1(model, val_loader)
         print(f'  Train: {train_loss:.4f} | CE: {ce_loss:.4f} | '
               f'SCM: {scm_loss:.4f} | Val F1: {val_f1:.4f}')
+
+        # Save when validation F1 improves
         if val_f1 > best_val_f1:
             best_val_f1, patience_cnt = val_f1, 0
             torch.save({'model_state_dict': model.state_dict(),
@@ -548,11 +547,15 @@ def train_model(save_path, lam=0.0, use_scm=False, label=''):
     return best_val_f1
 
 # ── PHASE 1: Train baseline ────────────────────────────────────────────────────
+
+# Train baseline
 baseline_path  = os.path.join(OUTPUT_DIR, 'contrastive_baseline.pt')
 baseline_val_f1 = train_model(baseline_path, lam=0.0, use_scm=False,
                                label='Baseline (no regularisation)')
 
 # ── PHASE 2: Lambda grid search ───────────────────────────────────────────────
+
+# Train one model per lambda
 print('\n' + '='*55)
 print('PHASE 2: Lambda grid search (contrastive SCM)')
 print('='*55)
@@ -569,16 +572,19 @@ best_lam_f1  = grid_results[best_lam]['val_f1']
 print(f'\nBest λ = {best_lam} (val F1 = {best_lam_f1:.4f})')
 print(f'Baseline val F1 = {baseline_val_f1:.4f}')
 
+# Save lambda results
 with open(os.path.join(OUTPUT_DIR, 'contrastive_grid_results.json'), 'w') as f:
     json.dump(grid_results, f, indent=2)
 print('Grid results saved.')
 
 # ── PHASE 3: Load best models and evaluate ────────────────────────────────────
+
 print('\n' + '='*55)
 print('PHASE 3: Full evaluation')
 print('='*55)
 
 def load_model(path):
+    # Load saved model
     m = BERTClassifier(N_LABELS).to(DEVICE)
     ckpt = torch.load(path, map_location=DEVICE)
     sd   = ckpt.get('model_state_dict', ckpt)
@@ -586,6 +592,7 @@ def load_model(path):
     m.eval()
     return m
 
+# Load baseline and best SCM model
 baseline_model = load_model(baseline_path)
 scm_model      = load_model(os.path.join(OUTPUT_DIR, f'contrastive_lam{best_lam}.pt'))
 
@@ -600,6 +607,7 @@ test_probs_b, test_labels = get_probabilities(baseline_model, test_loader)
 test_probs_s, _           = get_probabilities(scm_model,      test_loader)
 
 def apply_thresholds(probs, thresholds):
+    # Apply label-specific thresholds
     preds = np.zeros_like(probs)
     for i, t in enumerate(thresholds):
         preds[:, i] = (probs[:, i] >= t).astype(int)
@@ -608,12 +616,9 @@ def apply_thresholds(probs, thresholds):
 test_preds_b = apply_thresholds(test_probs_b, thresh_b)
 test_preds_s = apply_thresholds(test_probs_s, thresh_s)
 
-# ── Reliability, derived from an explicit rule (committee point: 30 vs 37) ──────
-# The old code hardcoded which articles were "reliable", so the stated rule
-# (<30) did not match the set actually used (Art.11 has 37 test positives yet
-# was excluded). Here reliability is COMPUTED from one documented basis and all
-# three candidate bases are reported, so the thesis can state precisely what the
-# threshold counts.
+# ── Reliability ────────────────────────────────────────────────────────────────
+
+# Build group indices for all keyword sets
 GROUP_INDICES = {
     name: {
         'gender'   : get_group_indices(raw['test'], s['gender']),
@@ -622,6 +627,7 @@ GROUP_INDICES = {
 }
 _active_eth_prot = GROUP_INDICES[KEYWORD_SET]['ethnicity'][0]
 
+# Count positives for each article
 reliability_counts = {}
 for i, art in enumerate(ARTICLE_NAMES):
     n_test_pos = int(test_labels[:, i].sum())                       # ground-truth positives
@@ -632,6 +638,7 @@ for i, art in enumerate(ARTICLE_NAMES):
         'test_pos': n_test_pos, 'pred_pos': n_pred_pos, 'protected_pos': n_prot_pos,
     }
 
+# Select reliable articles
 RELIABLE = {art for art, c in reliability_counts.items()
             if c[RELIABILITY_BASIS] >= MIN_RELIABLE}
 _legacy_reliable = {'Art.2','Art.3','Art.5','Art.6','Art.8','Art.10','P1-1'}
@@ -646,12 +653,13 @@ if RELIABLE != _legacy_reliable:
     print(f'NOTE: derived reliable set differs from the legacy hardcoded set.')
     print(f'  derived: {sorted(RELIABLE)}')
     print(f'  legacy : {sorted(_legacy_reliable)}')
-    print('  Update the thesis text to match the derived set and the stated basis.')
 
+# Save reliability file
 with open(os.path.join(OUTPUT_DIR, 'reliability_report.json'), 'w') as f:
     json.dump({'basis': RELIABILITY_BASIS, 'min_reliable': MIN_RELIABLE,
                'counts': reliability_counts, 'reliable': sorted(RELIABLE)}, f, indent=2)
 
+# Final F1 scores
 f1_b = f1_score(test_labels, test_preds_b, average='macro', zero_division=0)
 f1_s = f1_score(test_labels, test_preds_s, average='macro', zero_division=0)
 
@@ -659,6 +667,7 @@ print(f'\nBaseline macro F1 : {f1_b:.4f}')
 print(f'SCM (λ={best_lam}) macro F1: {f1_s:.4f}')
 print(f'ΔF1               : {f1_s - f1_b:+.4f}')
 
+# Per-article F1
 per_article_b = {ARTICLE_NAMES[i]: round(
     f1_score(test_labels[:,i], test_preds_b[:,i], zero_division=0), 4)
     for i in range(N_LABELS)}
@@ -666,6 +675,7 @@ per_article_s = {ARTICLE_NAMES[i]: round(
     f1_score(test_labels[:,i], test_preds_s[:,i], zero_division=0), 4)
     for i in range(N_LABELS)}
 
+# Save performance results
 performance_results = {
     'baseline': {'macro_f1': round(f1_b, 4), 'per_article': per_article_b},
     'scm'     : {'macro_f1': round(f1_s, 4), 'per_article': per_article_s,
@@ -677,11 +687,13 @@ with open(os.path.join(OUTPUT_DIR, 'contrastive_performance.json'), 'w') as f:
 print('Performance results saved.')
 
 # ── PHASE 4: Fairness evaluation ───────────────────────────────────────────────
+
 print('\n' + '='*55)
 print('PHASE 4: Fairness evaluation')
 print('='*55)
 
 def compute_dpd_di(probs, thresholds, protected_idx, unprotected_idx):
+    # Compute DPD and DI
     results = {}
     for i, art in enumerate(ARTICLE_NAMES):
         t = thresholds[i]
@@ -698,23 +710,24 @@ def compute_dpd_di(probs, thresholds, protected_idx, unprotected_idx):
         }
     return results
 
-# Group sizes for ALL keyword sets, so the robustness of the null to the group
-# definition is visible (answers the weak-proxy concern directly).
+# Print group sizes
 print('Group sizes by keyword set (protected / total):')
 for name in KEYWORD_SETS:
     g = len(GROUP_INDICES[name]['gender'][0])
     e = len(GROUP_INDICES[name]['ethnicity'][0])
     print(f'  {name:9s}  gender={g}/{len(raw["test"])}  ethnicity={e}/{len(raw["test"])}')
 
-# Active set for the headline fairness tables.
+# Use the active keyword set for the main tables
 gender_prot,    gender_unprot    = GROUP_INDICES[KEYWORD_SET]['gender']
 ethnicity_prot, ethnicity_unprot = GROUP_INDICES[KEYWORD_SET]['ethnicity']
 
+# Compute fairness metrics
 fair_b_gender    = compute_dpd_di(test_probs_b, thresh_b, gender_prot,    gender_unprot)
 fair_s_gender    = compute_dpd_di(test_probs_s, thresh_s, gender_prot,    gender_unprot)
 fair_b_ethnicity = compute_dpd_di(test_probs_b, thresh_b, ethnicity_prot, ethnicity_unprot)
 fair_s_ethnicity = compute_dpd_di(test_probs_s, thresh_s, ethnicity_prot, ethnicity_unprot)
 
+# Gender fairness table
 print('\n=== Gender Fairness ===')
 print(f'{"Article":8s}  {"Base DPD":10s}  {"SCM DPD":10s}  {"ΔDPD":8s}  {"Reliable"}')
 print('-' * 55)
@@ -724,6 +737,7 @@ for art in ARTICLE_NAMES:
     rel = '✓' if fair_b_gender[art]['reliable'] else '✗'
     print(f'{art:8s}  {b:10.4f}  {s:10.4f}  {s-b:8.4f}  {rel}')
 
+# Ethnicity fairness table
 print('\n=== Ethnicity Fairness ===')
 print(f'{"Article":8s}  {"Base DPD":10s}  {"SCM DPD":10s}  {"ΔDPD":8s}  {"Reliable"}')
 print('-' * 55)
@@ -733,6 +747,7 @@ for art in ARTICLE_NAMES:
     rel = '✓' if fair_b_ethnicity[art]['reliable'] else '✗'
     print(f'{art:8s}  {b:10.4f}  {s:10.4f}  {s-b:8.4f}  {rel}')
 
+# Save fairness results
 fairness_results = {
     'keyword_set': KEYWORD_SET,
     'group_info': {
@@ -749,10 +764,9 @@ with open(os.path.join(OUTPUT_DIR, 'contrastive_fairness.json'), 'w') as f:
 print('\nFairness results saved.')
 
 # ── PHASE 4b: lambda trade-off + keyword-set robustness ────────────────────────
-# Evaluating EVERY lambda (not just the val-selected one) makes the
-# fairness/performance/faithfulness trade-off curve data-driven and removes the
-# selection-optimism concern about reporting only the chosen lambda.
+
 def reliable_mean_dpd(fair):
+    # Mean DPD over reliable articles
     vals = [fair[a]['DPD'] for a in ARTICLE_NAMES if a in RELIABLE]
     return round(float(np.mean(vals)), 4) if vals else None
 
@@ -760,6 +774,8 @@ print('\n' + '='*55)
 print('PHASE 4b: lambda trade-off + keyword-set robustness')
 print('='*55)
 tradeoff = {}
+
+# Evaluate all lambdas
 for lam in LAMBDAS:
     ckpt = os.path.join(OUTPUT_DIR, f'contrastive_lam{lam}.pt')
     if not os.path.exists(ckpt):
@@ -776,8 +792,7 @@ for lam in LAMBDAS:
     print(f'  λ={lam:<5}  F1={f1_l:.4f}  ethnicity mean DPD={eth_dpd}')
     del m
 
-# Fairness across all keyword sets for baseline and the selected SCM model:
-# shows whether the null survives the choice of group definition.
+# Compare keyword sets
 robustness = {}
 for name in KEYWORD_SETS:
     gp, gu = GROUP_INDICES[name]['gender']
@@ -788,13 +803,16 @@ for name in KEYWORD_SETS:
         'ethnicity': {'baseline': compute_dpd_di(test_probs_b, thresh_b, ep, eu),
                       'scm'     : compute_dpd_di(test_probs_s, thresh_s, ep, eu)},
     }
+
+# Save robustness results
 with open(os.path.join(OUTPUT_DIR, 'tradeoff_and_robustness.json'), 'w') as f:
     json.dump({'pairs': args.pairs, 'encoder': args.encoder,
                'lambda_tradeoff': tradeoff, 'keyword_robustness': robustness}, f, indent=2)
 print('Trade-off and robustness results saved.')
 
 # ── PHASE 5: SHAP faithfulness ─────────────────────────────────────────────────
-# Guarded by --skip_shap so cheap multi-seed runs do training + fairness only.
+
+# Optionally skip SHAP
 if args.skip_shap:
     print('\n' + '=' * 55)
     print('PHASE 5: SHAP faithfulness — SKIPPED (--skip_shap)')
@@ -807,6 +825,7 @@ else:
     print('=' * 55)
 
     def make_predict_fn(model):
+        # SHAP prediction wrapper
         def predict_fn(token_array):
             all_probs = []
             for i in range(0, len(token_array), 32):
@@ -820,7 +839,8 @@ else:
             return np.vstack(all_probs)
         return predict_fn
 
-    def compute_faithfulness(model, label=''):  # PATCHED_FAITHFULNESS_REALTOKENS_V1
+    def compute_faithfulness(model, label=''):
+        # Compute SHAP faithfulness scores
         print(f'\nFaithfulness: {label}')
         model.eval()
         predict_fn = make_predict_fn(model)
@@ -828,6 +848,7 @@ else:
         rng        = np.random.default_rng(SEED)
         indices    = rng.choice(len(test_dataset), size=SHAP_N_DOCS, replace=False)
 
+        # Background examples for SHAP
         bg_idx  = rng.choice(len(train_dataset), size=SHAP_N_BG, replace=False)
         background = np.stack([
             train_dataset[int(i)]['input_ids'].numpy() for i in bg_idx])
@@ -839,6 +860,7 @@ else:
                         for k in K_VALUES}
         t_start = time.time()
 
+        # Run SHAP on sampled documents
         for doc_num, idx in enumerate(indices):
             if doc_num % 20 == 0 and doc_num > 0:
                 elapsed   = (time.time() - t_start) / 60
@@ -851,11 +873,12 @@ else:
             attn_mask = item['attention_mask'].unsqueeze(0).to(DEVICE)
             ids_np    = input_ids.cpu().numpy()
 
+            # Token importance from SHAP values
             shap_vals        = explainer.shap_values(ids_np, nsamples=512, silent=True)
             shap_matrix      = np.stack([sv[0] for sv in shap_vals], axis=-1)
             token_importance = np.abs(shap_matrix).mean(axis=-1)
 
-            # FIX: rank/mask only REAL tokens (attended, excluding [CLS]).
+            # Only rank real tokens
             attn_np  = attn_mask.squeeze(0).cpu().numpy()
             real_pos = np.where(attn_np == 1)[0]
             real_pos = real_pos[real_pos != 0]          # drop [CLS]
@@ -864,16 +887,19 @@ else:
                 continue
             imp_real = token_importance[real_pos]
 
+            # Original prediction
             with torch.no_grad():
                 orig_prob = torch.sigmoid(
                     model(input_ids, attn_mask)['logits']).cpu().numpy()
 
+            # Evaluate all k values
             for k in K_VALUES:
                 top_k_n   = max(1, int(seq_len * k))
                 order     = np.argsort(imp_real)
                 top_k_pos = set(real_pos[order[-top_k_n:]].tolist())
                 non_top_k = [int(p) for p in real_pos if int(p) not in top_k_pos]
 
+                # Sufficiency
                 suf_ids = ids_np.copy()
                 if non_top_k:
                     suf_ids[0, non_top_k] = mask_id
@@ -883,6 +909,7 @@ else:
                         model(suf_t, attn_mask)['logits']).cpu().numpy()
                 sufficiency = float(np.abs(orig_prob - suf_prob).mean())
 
+                # Comprehensiveness
                 com_ids = ids_np.copy()
                 com_ids[0, list(top_k_pos)] = mask_id
                 com_t = torch.tensor(com_ids, dtype=torch.long).to(DEVICE)
@@ -894,6 +921,7 @@ else:
                 results_by_k[k]['sufficiency'].append(sufficiency)
                 results_by_k[k]['comprehensiveness'].append(comprehensiveness)
 
+        # Average results
         aggregated = {}
         per_doc    = {}
         print(f'\n  {"k":6s}  {"Sufficiency":>12s}  {"Comprehensiveness":>18s}')
@@ -912,9 +940,11 @@ else:
         print(f'  Total: {total_min:.1f} min')
         return aggregated, per_doc
 
+    # Run faithfulness for both models
     faith_baseline, perdoc_baseline = compute_faithfulness(baseline_model, 'Baseline')
     faith_scm,      perdoc_scm      = compute_faithfulness(scm_model, f'SCM (λ={best_lam})')
 
+    # Save faithfulness results
     faithfulness_results = {
         'baseline': faith_baseline,
         'scm'     : faith_scm,
@@ -928,6 +958,8 @@ else:
     print('\nFaithfulness results saved (aggregated + per-doc).')
 
 # ── Final summary ──────────────────────────────────────────────────────────────
+
+# Print summary
 print('\n' + '='*55)
 print('ALL DONE — SUMMARY')
 print('='*55)
@@ -940,3 +972,4 @@ print(f'SCM macro F1      : {f1_s:.4f} (λ={best_lam})')
 print(f'ΔF1               : {f1_s - f1_b:+.4f}')
 print(f'\nFiles saved to {OUTPUT_DIR}')
 print('Done!')
+```
