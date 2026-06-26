@@ -78,6 +78,11 @@ figures/
   make_dissociation_fig.py         Figure 5 (the dissociation across conditions).
   make_fig_lambda.py               Faithfulness-lambda figure.
 
+EDA_improved_version2.ipynb      Exploratory data analysis: label distribution
+                                 across the ten target articles, document length
+                                 statistics, and keyword group size verification
+                                 for gender and ethnicity proxies.
+
 slurm/
   submit_5seeds.sh                 Launches the five-seed SCM and shuffled runs.
   run_wordpair.slurm               Launches the word-pair control.
